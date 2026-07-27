@@ -3,6 +3,8 @@ import re
 import datetime
 import json
 import asyncio
+import time
+import threading
 from flask import Flask, request
 import requests
 from playwright.async_api import async_playwright
@@ -17,6 +19,9 @@ SUNRISE_STATIONS = [
     "岡山", "児島", "坂出", "高松", 
     "倉敷", "備中高梁", "新見", "米子", "安来", "松江", "宍道", "出雲市"
 ]
+
+# 監視タスクの保持リスト
+monitoring_jobs = []
 
 def parse_line_message(text):
     is_extra = "臨時" in text
@@ -71,21 +76,15 @@ async def check_e5489_seats(parsed):
         page = await browser.new_page()
         
         try:
-            # e5489 空席照会ページへアクセス
             await page.goto("https://www.e5489.jr-odekake.net/e5489/cspg/SSTrainSearchCommonEmptyTopStartActionInit.do", timeout=30000)
-            
-            # 発着駅の入力
             await page.fill('input[name="depStnName"]', parsed["dep"])
             await page.fill('input[name="arrStnName"]', parsed["arr"])
-            
-            # 検索ボタン実行
             await page.click('input[type="submit"]')
             await page.wait_for_load_state("networkidle")
             
             content = await page.content()
             await browser.close()
 
-            # 空席マーク（○ または △）の判定
             if "○" in content or "△" in content:
                 return True, "空席あり（〇または△）"
             else:
@@ -96,11 +95,10 @@ async def check_e5489_seats(parsed):
             await browser.close()
             return False, "エラーまたは満席"
 
+# ─── LINE 応答（Reply） ───
 def send_line_reply(reply_token, message_text):
     if not LINE_CHANNEL_ACCESS_TOKEN:
-        print("Error: LINE_CHANNEL_ACCESS_TOKEN is not set.")
         return
-
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
         "Content-Type": "application/json",
@@ -112,9 +110,54 @@ def send_line_reply(reply_token, message_text):
     }
     requests.post(url, headers=headers, data=json.dumps(payload))
 
+# ─── LINE プッシュ通知（Push Message） ───
+def send_line_push(user_id, message_text):
+    if not LINE_CHANNEL_ACCESS_TOKEN or not user_id:
+        return
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+    }
+    payload = {
+        "to": user_id,
+        "messages": [{"type": "text", "text": message_text}]
+    }
+    requests.post(url, headers=headers, data=json.dumps(payload))
+
+# ─── 5分ごとのバックグラウンド監視ループ ───
+def monitor_loop():
+    while True:
+        try:
+            if monitoring_jobs:
+                print(f"[{datetime.datetime.now()}] Checking {len(monitoring_jobs)} monitoring jobs...")
+                for job in list(monitoring_jobs):
+                    parsed = job["parsed"]
+                    user_id = job["user_id"]
+                    
+                    has_seat, detail = asyncio.run(check_e5489_seats(parsed))
+                    date_str = parsed["date"].strftime("%Y-%m-%d")
+                    
+                    if has_seat:
+                        push_msg = (
+                            f"【🎉 空席検知！！】\n"
+                            f"監視中の列車に空席が出ました！今すぐ予約してください！\n\n"
+                            f"■ 列車情報\n"
+                            f"・列車名: {parsed['train_name']}\n"
+                            f"・乗車日: {date_str}\n"
+                            f"・区間: {parsed['dep']} ➔ {parsed['arr']}\n"
+                            f"・状態: {detail}"
+                        )
+                        send_line_push(user_id, push_msg)
+                        monitoring_jobs.remove(job)
+        except Exception as e:
+            print(f"Monitor loop error: {e}")
+            
+        time.sleep(300)
+
 @app.route("/", methods=['GET'])
 def index():
-    return "Sunrise Seat Monitor (e5489 Engine) is Running!"
+    return "Sunrise Seat Monitor is Running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -124,18 +167,18 @@ def callback():
     for event in events:
         if event.get('type') == 'message':
             reply_token = event.get('replyToken')
+            user_id = event.get('source', {}).get('userId')
             user_text = event['message'].get('text', '')
             parsed = parse_line_message(user_text)
             
             if parsed and reply_token:
-                # e5489 の空席チェック実行
                 has_seat, detail = asyncio.run(check_e5489_seats(parsed))
                 date_str = parsed["date"].strftime("%Y-%m-%d")
                 
                 if has_seat:
                     reply_msg = (
                         f"【空席あり！】\n"
-                        f"e5489にて空席が確認できました！\n"
+                        f"現在、ご指定の条件で空席が見つかりました！\n"
                         f"状態: {detail}\n\n"
                         f"■ 対象列車\n"
                         f"・列車名: {parsed['train_name']}\n"
@@ -146,18 +189,23 @@ def callback():
                 else:
                     reply_msg = (
                         f"【満席 / 監視を開始します】\n"
-                        f"現在、ご指定の条件は満席です。\n"
-                        f"このまま裏で定期照会を行い、空席が出たら即座にお知らせします！\n\n"
+                        f"現在満席です。5分おきに裏で自動照会を行い、空席が出たら即座にLINEでお知らせします！\n\n"
                         f"■ 監視条件\n"
                         f"・列車名: {parsed['train_name']}\n"
                         f"・乗車日: {date_str}\n"
                         f"・区間: {parsed['dep']} ➔ {parsed['arr']}"
                     )
+                    job_exists = any(j["parsed"]["raw_text"] == user_text and j["user_id"] == user_id for j in monitoring_jobs)
+                    if not job_exists:
+                        monitoring_jobs.append({"parsed": parsed, "user_id": user_id})
                 
                 send_line_reply(reply_token, reply_msg)
             
     return 'OK', 200
 
 if __name__ == "__main__":
+    t_monitor = threading.Thread(target=monitor_loop, daemon=True)
+    t_monitor.start()
+
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
