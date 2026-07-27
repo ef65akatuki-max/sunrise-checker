@@ -1,15 +1,14 @@
 import os
 import re
-import time
 import datetime
 import json
-from flask import Flask, request, abort
+import asyncio
+from flask import Flask, request
 import requests
-from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 
 app = Flask(__name__)
 
-CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "A5c1f7dd4e3d3cc3277cb2d0ad125c0f")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 SUNRISE_STATIONS = [
@@ -20,9 +19,7 @@ SUNRISE_STATIONS = [
 ]
 
 def parse_line_message(text):
-    is_monitor = "監視" in text
     is_extra = "臨時" in text
-    
     date_match = re.search(r'(\d{1,2})月(\d{1,2})日', text)
     if not date_match:
         return None
@@ -64,28 +61,40 @@ def parse_line_message(text):
         "raw_text": text
     }
 
-# ─── JRサイバーステーションからリアルタイムで空席照会する関数 ───
-def check_real_jr_seats(parsed):
-    try:
-        url = "https://www me.cyberstation.ne.jp/seat/index.html" # サイバーステーション照会API/フォーム
-        # ※ 実際のスクレイピング処理: 乗車日、出発地、到着地を投げてhtmlを解析
+# ─── Playwright による e5489 自動照会 ───
+async def check_e5489_seats(parsed):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox"]
+        )
+        page = await browser.new_page()
         
-        # 例として、乗車日・区間のパラメータを準備
-        dt = parsed["date"]
-        
-        # 実際にリクエストを送って「○」や「△」があるかチェックする処理
-        # （ここではデモ用にリクエスト枠を用意。実際のレスポンスに「○」「△」が含まれればTrue）
-        # 仮のレスポンス解析ロジック例:
-        # response = requests.post(url, data={...})
-        # is_available = "○" in response.text or "△" in response.text
-        
-        # 今回はサイバーステーションの構造に合わせた空席判定を行います
-        is_available = False # 実際の取得値が入る
-        
-        return is_available
-    except Exception as e:
-        print(f"Error checking seats: {e}")
-        return False
+        try:
+            # e5489 空席照会ページへアクセス
+            await page.goto("https://www.e5489.jr-odekake.net/e5489/cspg/SSTrainSearchCommonEmptyTopStartActionInit.do", timeout=30000)
+            
+            # 発着駅の入力
+            await page.fill('input[name="depStnName"]', parsed["dep"])
+            await page.fill('input[name="arrStnName"]', parsed["arr"])
+            
+            # 検索ボタン実行
+            await page.click('input[type="submit"]')
+            await page.wait_for_load_state("networkidle")
+            
+            content = await page.content()
+            await browser.close()
+
+            # 空席マーク（○ または △）の判定
+            if "○" in content or "△" in content:
+                return True, "空席あり（〇または△）"
+            else:
+                return False, "満席"
+
+        except Exception as e:
+            print(f"e5489 scraping error: {e}")
+            await browser.close()
+            return False, "エラーまたは満席"
 
 def send_line_reply(reply_token, message_text):
     if not LINE_CHANNEL_ACCESS_TOKEN:
@@ -105,7 +114,7 @@ def send_line_reply(reply_token, message_text):
 
 @app.route("/", methods=['GET'])
 def index():
-    return "Sunrise Seat Monitor is Running!"
+    return "Sunrise Seat Monitor (e5489 Engine) is Running!"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -119,23 +128,22 @@ def callback():
             parsed = parse_line_message(user_text)
             
             if parsed and reply_token:
-                # JRの空席情報をリアルタイム照会
-                has_seat = check_real_jr_seats(parsed)
+                # e5489 の空席チェック実行
+                has_seat, detail = asyncio.run(check_e5489_seats(parsed))
                 date_str = parsed["date"].strftime("%Y-%m-%d")
                 
                 if has_seat:
-                    # 空席があった場合
                     reply_msg = (
                         f"【空席あり！】\n"
-                        f"ご指定の条件で空席が見つかりました！\n\n"
+                        f"e5489にて空席が確認できました！\n"
+                        f"状態: {detail}\n\n"
                         f"■ 対象列車\n"
                         f"・列車名: {parsed['train_name']}\n"
                         f"・乗車日: {date_str}\n"
                         f"・区間: {parsed['dep']} ➔ {parsed['arr']}\n\n"
-                        f"お早めに e5489 やみどりの窓口等でご予約ください！"
+                        f"お早めに e5489 からご予約ください！"
                     )
                 else:
-                    # 満席だった場合
                     reply_msg = (
                         f"【満席 / 監視を開始します】\n"
                         f"現在、ご指定の条件は満席です。\n"
