@@ -3,12 +3,15 @@ import re
 import time
 import threading
 import datetime
+import json
 from flask import Flask, request, abort
 import requests
 
 app = Flask(__name__)
 
-CHANNEL_SECRET = "A5c1f7dd4e3d3cc3277cb2d0ad125c0f"
+# LINEの環境変数（Render側で設定したものを使用、なければ直書き値を使用）
+CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "A5c1f7dd4e3d3cc3277cb2d0ad125c0f")
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 SUNRISE_STATIONS = [
     "東京", "横浜", "熱海", "沼津", "富士", "静岡", "浜松", 
@@ -77,6 +80,28 @@ def parse_line_message(text):
         "arr": arr_station
     }
 
+# LINEに返信を送る関数
+def send_line_reply(reply_token, message_text):
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        print("Error: LINE_CHANNEL_ACCESS_TOKEN is not set.")
+        return
+
+    url = "https://api.line.me/v2/bot/message/reply"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+    }
+    payload = {
+        "replyToken": reply_token,
+        "messages": [
+            {
+                "type": "text",
+                "text": message_text
+            }
+        ]
+    }
+    requests.post(url, headers=headers, data=json.dumps(payload))
+
 @app.route("/", methods=['GET'])
 def index():
     return "Sunrise Seat Monitor is Running!"
@@ -88,10 +113,26 @@ def callback():
     
     for event in events:
         if event.get('type') == 'message':
+            reply_token = event.get('replyToken')
             user_text = event['message'].get('text', '')
             parsed = parse_line_message(user_text)
-            if parsed:
-                pass
+            
+            if parsed and reply_token:
+                # 返信メッセージの作成
+                reply_msg = (
+                    f"【満席 / 監視を開始します】\n"
+                    f"現在、ご指定の条件は満席です。\n"
+                    f"このまま裏で定期照会を行い、空席が出たら即座にお知らせします！\n\n"
+                    f"■ 監視条件\n"
+                    f"・列車名: {parsed['train_name']}\n"
+                    f"・乗車日: {parsed['date']}\n"
+                    f"・区間: {parsed['dep']} ➔ {parsed['arr']}"
+                )
+                
+                # LINEへ即座に返信
+                send_line_reply(reply_token, reply_msg)
+                
+                # ※ここに実際の空席巡回ロジック（threading等）を呼び出す処理が入ります
             
     return 'OK', 200
 
