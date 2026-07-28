@@ -18,7 +18,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 # ─── メール送信設定 ───
 MAIL_USER = "ef65akatuki@gmail.com"
-MAIL_PASSWORD = os.environ.get("MAIL_PASSWORD", "") # Render環境変数に設定
+MAIL_PASSWORD = os.environ.get("MAIL_PASSWORD", "")
 
 # 空席検知時に通知を送るメールアドレスのリスト
 MAIL_RECIPIENTS_ALERT = ["ef65akatuki@gmail.com", "as1567@sel.co.jp"]
@@ -35,8 +35,7 @@ SUNRISE_STATIONS = [
 monitoring_jobs = []
 
 def parse_line_message(text):
-    is_extra = "臨時" in text
-    date_match = re.search(r'(\d{1,2})月(\d{1,2})日', text)
+    date_match = re.search(r'(\d{1,2})[月/](\d{1,2})日?', text)
     if not date_match:
         return None
 
@@ -45,29 +44,38 @@ def parse_line_message(text):
     current_year = datetime.datetime.now().year
     target_date = datetime.date(current_year, month, day)
 
-    train_name = "サンライズ出雲" if "出雲" in text else "サンライズ瀬戸"
+    if "瀬戸" in text:
+        train_name = "サンライズ瀬戸"
+    else:
+        train_name = "サンライズ出雲"
 
     found_stations = []
-    for word in text.replace("→", " ").replace("から", " ").replace("まで", " ").split():
-        clean_word = re.sub(r'[^\w]', '', word)
-        for st in SUNRISE_STATIONS:
-            if st in clean_word and st not in found_stations:
-                found_stations.append(st)
+    for st in SUNRISE_STATIONS:
+        if st in text:
+            pos = text.find(st)
+            found_stations.append((pos, st))
+    
+    found_stations.sort(key=lambda x: x[0])
+    ordered_stations = [st for pos, st in found_stations]
 
-    direction = "上り" if "上り" in text else ("下り" if "下り" in text else None)
-
-    if len(found_stations) >= 2:
-        dep_station = found_stations[0]
-        arr_station = found_stations[1]
+    if len(ordered_stations) >= 2:
+        dep_station = ordered_stations[0]
+        arr_station = ordered_stations[-1]
     else:
-        if not direction:
-            direction = "上り"
-        if direction == "上り":
-            dep_station = "出雲市" if "出雲" in train_name else "高松"
-            arr_station = "東京"
+        if "上り" in text or ("岡山" in text and "東京" in text and text.find("岡山") < text.find("東京")):
+            if len(ordered_stations) == 1:
+                dep_station = ordered_stations[0]
+                arr_station = "東京"
+            else:
+                dep_station = "出雲市" if "出雲" in train_name else "高松"
+                arr_station = "東京"
         else:
-            dep_station = "東京"
-            arr_station = "出雲市" if "出雲" in train_name else "高松"
+            if len(ordered_stations) == 1:
+                dep_station = ordered_stations[0]
+                arr_station = "出雲市" if "出雲" in train_name else "高松"
+            else:
+                dep_station = "東京"
+                arr_station = "出雲市" if "出雲" in train_name else "高松"
 
     return {
         "train_name": train_name,
@@ -77,10 +85,9 @@ def parse_line_message(text):
         "raw_text": text
     }
 
-# ─── 単一宛先へのメール送信関数（生存確認用） ───
 def send_single_email(to_email, subject, body):
     if not MAIL_PASSWORD:
-        print("Error: MAIL_PASSWORD (App Password) is not set.")
+        print("Error: MAIL_PASSWORD is not set.")
         return
     try:
         msg = MIMEMultipart()
@@ -94,14 +101,12 @@ def send_single_email(to_email, subject, body):
         server.login(MAIL_USER, MAIL_PASSWORD)
         server.sendmail(MAIL_USER, to_email, msg.as_string())
         server.quit()
-        print(f"Single email sent successfully to {to_email}")
     except Exception as e:
-        print(f"Failed to send single email to {to_email}: {e}")
+        print(f"Failed to send email: {e}")
 
-# ─── 複数宛先へのメール送信関数（空席検知用） ───
 def send_alert_email(subject, body):
     if not MAIL_PASSWORD:
-        print("Error: MAIL_PASSWORD (App Password) is not set.")
+        print("Error: MAIL_PASSWORD is not set.")
         return
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587)
@@ -114,51 +119,59 @@ def send_alert_email(subject, body):
             msg['From'] = MAIL_USER
             msg['To'] = recipient
             msg.attach(MIMEText(body, 'plain'))
-            
             server.sendmail(MAIL_USER, recipient, msg.as_string())
-            print(f"Alert email sent successfully to {recipient}")
 
         server.quit()
     except Exception as e:
         print(f"Failed to send alert email: {e}")
 
-# ─── Playwright による e5489 自動照会（判定・待機強化版） ───
+# ─── Playwright による安定化・リトライ付き空席チェック ───
 async def check_e5489_seats(parsed):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
-        )
-        page = await browser.new_page()
-        
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
         try:
-            await page.goto("https://www.e5489.jr-odekake.net/e5489/cspg/SSTrainSearchCommonEmptyTopStartActionInit.do", timeout=30000)
-            await page.fill('input[name="depStnName"]', parsed["dep"])
-            await page.fill('input[name="arrStnName"]', parsed["arr"])
-            await page.click('input[type="submit"]')
-            
-            # ネットワークが落ち着くまで待機したあと、念のためさらに数秒追加で待機して描画を確実に待つ
-            await page.wait_for_load_state("networkidle")
-            await asyncio.sleep(3)
-            
-            content = await page.content()
-            await browser.close()
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox"]
+                )
+                page = await browser.new_page()
+                
+                # e5489の検索トップへアクセス
+                await page.goto("https://www.e5489.jr-odekake.net/e5489/cspg/SSTrainSearchCommonEmptyTopStartActionInit.do", timeout=30000)
+                
+                # 駅名フォームに直接入力
+                await page.fill('input[name="depStnName"]', parsed["dep"])
+                await page.fill('input[name="arrStnName"]', parsed["arr"])
+                
+                # 日付情報がある場合はフォームまたは隠し要素へ反映させるか、サブミットを実行
+                # ここで確実に検索ボタンを押下
+                await page.click('input[type="submit"]')
+                
+                # 描画とネットワークの落ち着きを待つ
+                await page.wait_for_load_state("networkidle")
+                await asyncio.sleep(4)
+                
+                content = await page.content()
+                await browser.close()
 
-            # 判定キーワードを拡張（〇、△に加え、残席やわずかなどのテキストも検知）
-            seat_keywords = ["○", "△", "残席", "わずか", "残り", "空席"]
-            found_keyword = next((kw for kw in seat_keywords if kw in content), None)
+                # 判定キーワードの拡張（○、△に加え「残席」「わずか」「残り」「空席」を網羅）
+                seat_keywords = ["○", "△", "残席", "わずか", "残り", "空席"]
+                found_keyword = next((kw for kw in seat_keywords if kw in content), None)
 
-            if found_keyword:
-                return True, f"空席あり（検出キーワード: {found_keyword}）"
-            else:
-                return False, "満席"
+                if found_keyword:
+                    return True, f"空席あり（検出キーワード: {found_keyword}）"
+                else:
+                    return False, "満席"
 
         except Exception as e:
-            print(f"e5489 scraping error: {e}")
-            await browser.close()
-            return False, "エラーまたは満席"
+            print(f"e5489 scraping error (attempt {attempt+1}/{MAX_RETRIES}): {e}")
+            if attempt == MAX_RETRIES - 1:
+                return False, "エラーまたは満席"
+            await asyncio.sleep(2)
+            
+    return False, "エラーまたは満席"
 
-# ─── LINE 応答（Reply） ───
 def send_line_reply(reply_token, message_text):
     if not LINE_CHANNEL_ACCESS_TOKEN:
         return
@@ -173,7 +186,6 @@ def send_line_reply(reply_token, message_text):
     }
     requests.post(url, headers=headers, data=json.dumps(payload))
 
-# ─── LINE プッシュ通知（Push Message） ───
 def send_line_push(user_id, message_text):
     if not LINE_CHANNEL_ACCESS_TOKEN or not user_id:
         return
@@ -188,7 +200,6 @@ def send_line_push(user_id, message_text):
     }
     requests.post(url, headers=headers, data=json.dumps(payload))
 
-# ─── 5分ごとのバックグラウンド監視ループ ───
 def monitor_loop():
     while True:
         try:
@@ -219,7 +230,6 @@ def monitor_loop():
                     send_alert_email(f"【空席検知】{parsed['train_name']} {date_str}", alert_msg)
                     monitoring_jobs.remove(job)
 
-            # 監視タスクが登録されている場合、生存確認を送信
             if monitoring_jobs:
                 jobs_text = "\n".join(job_summaries)
                 send_single_email(
