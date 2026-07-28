@@ -65,8 +65,11 @@ async def check_e5489_seats(parsed):
 
         except Exception as e:
             print(f"e5489 scraping error (attempt {attempt+1}/{MAX_RETRIES}): {e}")
-            if attempt == MAX_RETRIES - 1:
-                return False, "エラーまたは満席"
-            await asyncio.sleep(2)
-            
-    return False, "エラーまたは満席"
+            if __name__ == "__main__":
+    t_monitor = threading.Thread(target=monitor_loop, daemon=True)
+    t_monitor.start()
+
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+    
