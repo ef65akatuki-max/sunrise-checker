@@ -20,17 +20,64 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 MAIL_USER = "ef65akatuki@gmail.com"
 MAIL_PASSWORD = os.environ.get("MAIL_PASSWORD", "")
 
-# 空席検知時に通知を送るメールアドレスのリスト
 MAIL_RECIPIENTS_ALERT = ["ef65akatuki@gmail.com", "as1567@sel.co.jp"]
-# 定期生存確認を送るメールアドレス
 MAIL_RECIPIENT_ALIVE = "ef65akatuki@gmail.com"
 
-SUNRISE_STATIONS = [
-    "東京", "横浜", "熱海", "沼津", "富士", "静岡", "浜松", 
-    "豊橋", "名古屋", "岐阜", "大阪", "三ノ宮", "姫路", 
-    "岡山", "児島", "坂出", "高松", 
-    "倉敷", "備中高梁", "新見", "米子", "安来", "松江", "宍道", "出雲市"
-]
+# ─── sunrise.rutice.net 準拠のデータ定義 ───
+ST_NAME_LIST_NO = {
+    '東京': '%93%8C%8B%9E',
+    '横浜': '%89%A1%95l',
+    '熱海': '%94M%8AC',
+    '沼津': '%8F%C0%92%C3',
+    '富士': '%95x%8Em',
+    '静岡': '%90%C3%89%AA',
+    '浜松': '%95l%8F%BC',
+    '大阪': '%91%E5%8D%E3',
+    '三ノ宮': '%8EO%83m%8B%7B',
+    '姫路': '%95P%98H',
+    '岡山': '%89%AA%8ER',
+    '児島': '%8E%99%93%87',
+    '坂出': '%8D%E2%8Fo',
+    '高松': '%8D%82%8F%BC%81i%8D%81%90%EC%8C%A7%81j',
+    '多度津': '%91%BD%93x%92%C3',
+    '善通寺': '%91P%92%CA%8E%9B',
+    '琴平': '%8B%D5%95%BD',
+    '倉敷': '%91q%95~',
+    '備中高梁': '%94%F5%92%86%8D%82%97%C0',
+    '新見': '%90V%8C%A9',
+    '米子': '%95%C4%8Eq',
+    '安来': '%88%C0%97%88',
+    '松江': '%8F%BC%8D%5D',
+    '宍道': '%8E%B3%93%B9',
+    '出雲市': '%8Fo%89_%8Es'
+}
+
+FACILITY_IDS = {
+    'seto': {
+        '未指定': '%BB%BE%C4%20%20000',
+        '普通車ノビノビ座席': '%BB%BE%C4%20%20000',
+        'シングルデラックス': '%BB%BE%C4%20%20000',
+        'シングルツイン': '%BB%BE%C4%20%20000',
+        'シングル': '%BB%BE%C4%BC%20000',
+        'ソロ': '%BB%BE%C4%BF%20000',
+        'サンライズツイン': '%BB%BE%C4%BB%20000'
+    },
+    'izumo': {
+        '未指定': '%BB%B2%BD%D3%20%20000',
+        '普通車ノビノビ座席': '%BB%B2%BD%D3%20000',
+        'シングルデラックス': '%BB%B2%BD%D3%20000',
+        'シングルツイン': '%BB%B2%BD%D3%20000',
+        'シングル': '%BB%B2%BD%D3%BC000',
+        'ソロ': '%BB%B2%BD%D3%BF000',
+        'サンライズツイン': '%BB%B2%BD%D3%BB000'
+    }
+}
+
+# 発車時刻の目安（rutice.net の定義に合わせる）
+TRAIN_TIMES = {
+    "サンライズ瀬戸": {"dep_time": "21:26", "type_key": "seto"},
+    "サンライズ出雲": {"dep_time": "21:26", "type_key": "izumo"}
+}
 
 monitoring_jobs = []
 
@@ -49,8 +96,9 @@ def parse_line_message(text):
     else:
         train_name = "サンライズ出雲"
 
+    # 駅名の抽出
     found_stations = []
-    for st in SUNRISE_STATIONS:
+    for st in ST_NAME_LIST_NO.keys():
         if st in text:
             pos = text.find(st)
             found_stations.append((pos, st))
@@ -62,20 +110,12 @@ def parse_line_message(text):
         dep_station = ordered_stations[0]
         arr_station = ordered_stations[-1]
     else:
-        if "上り" in text or ("岡山" in text and "東京" in text and text.find("岡山") < text.find("東京")):
-            if len(ordered_stations) == 1:
-                dep_station = ordered_stations[0]
-                arr_station = "東京"
-            else:
-                dep_station = "出雲市" if "出雲" in train_name else "高松"
-                arr_station = "東京"
+        if "上り" in text:
+            dep_station = "岡山" # デフォルト例
+            arr_station = "東京"
         else:
-            if len(ordered_stations) == 1:
-                dep_station = ordered_stations[0]
-                arr_station = "出雲市" if "出雲" in train_name else "高松"
-            else:
-                dep_station = "東京"
-                arr_station = "出雲市" if "出雲" in train_name else "高松"
+            dep_station = "東京"
+            arr_station = "岡山"
 
     return {
         "train_name": train_name,
@@ -87,7 +127,6 @@ def parse_line_message(text):
 
 def send_single_email(to_email, subject, body):
     if not MAIL_PASSWORD:
-        print("Error: MAIL_PASSWORD is not set.")
         return
     try:
         msg = MIMEMultipart()
@@ -95,7 +134,6 @@ def send_single_email(to_email, subject, body):
         msg['From'] = MAIL_USER
         msg['To'] = to_email
         msg.attach(MIMEText(body, 'plain'))
-
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         server.login(MAIL_USER, MAIL_PASSWORD)
@@ -106,13 +144,11 @@ def send_single_email(to_email, subject, body):
 
 def send_alert_email(subject, body):
     if not MAIL_PASSWORD:
-        print("Error: MAIL_PASSWORD is not set.")
         return
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         server.login(MAIL_USER, MAIL_PASSWORD)
-
         for recipient in MAIL_RECIPIENTS_ALERT:
             msg = MIMEMultipart()
             msg['Subject'] = subject
@@ -120,16 +156,49 @@ def send_alert_email(subject, body):
             msg['To'] = recipient
             msg.attach(MIMEText(body, 'plain'))
             server.sendmail(MAIL_USER, recipient, msg.as_string())
-
         server.quit()
     except Exception as e:
         print(f"Failed to send alert email: {e}")
 
-# ─── Playwright による安定化・リトライ付き空席チェック ───
+# ─── sunrise.rutice.net のURL構築ロジックによる直接照会 ───
 async def check_e5489_seats(parsed):
     MAX_RETRIES = 3
     for attempt in range(MAX_RETRIES):
         try:
+            train_info = TRAIN_TIMES.get(parsed["train_name"], TRAIN_TIMES["サンライズ出雲"])
+            t_key = train_info["type_key"]
+            dep_time = train_info["dep_time"] # "21:26"
+            
+            encoded_depart = ST_NAME_LIST_NO.get(parsed["dep"], '%93%8C%8B%9E')
+            encoded_arrive = ST_NAME_LIST_NO.get(parsed["arr"], '%89%AA%8ER')
+            facility_id = FACILITY_IDS[t_key]['未指定']
+            
+            date_str = parsed["date"].strftime("%Y%m%d")
+            
+            # rutice.net と同じ SP版/PC版 共通の組み立てURLベース
+            action = 'https://e5489.jr-odekake.net/e5489/cssp/CBDayTimeArriveSelRsvMyDiaSP?'
+            
+            param = (
+                f"inputDepartStName={encoded_depart}"
+                f"&inputArriveStName={encoded_arrive}"
+                f"&inputType=0"
+                f"&inputDate={date_str}"
+                f"&inputHour={dep_time.split(':')[0]}"
+                f"&inputMinute={dep_time.split(':')[1]}"
+                f"&inputUniqueDepartSt=1"
+                f"&inputUniqueArriveSt=1"
+                f"&inputSearchType=1"
+                f"&inputTransferDepartStName1={encoded_depart}"
+                f"&inputTransferArriveStName1={encoded_arrive}"
+                f"&inputTransferDepartStUnique1=1"
+                f"&inputTransferArriveStUnique1=1"
+                f"&inputTransferTrainType1=0001"
+                f"&inputSpecificTrainType1=2"
+                f"&inputSpecificBriefTrainKana1={facility_id}"
+                f"&SequenceType=0"
+            )
+            target_url = action + param
+
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=True,
@@ -137,25 +206,14 @@ async def check_e5489_seats(parsed):
                 )
                 page = await browser.new_page()
                 
-                # e5489の検索トップへアクセス
-                await page.goto("https://www.e5489.jr-odekake.net/e5489/cspg/SSTrainSearchCommonEmptyTopStartActionInit.do", timeout=30000)
-                
-                # 駅名フォームに直接入力
-                await page.fill('input[name="depStnName"]', parsed["dep"])
-                await page.fill('input[name="arrStnName"]', parsed["arr"])
-                
-                # 日付情報がある場合はフォームまたは隠し要素へ反映させるか、サブミットを実行
-                # ここで確実に検索ボタンを押下
-                await page.click('input[type="submit"]')
-                
-                # 描画とネットワークの落ち着きを待つ
+                # 構築した完全なURLに直接アクセス
+                await page.goto(target_url, timeout=30000)
                 await page.wait_for_load_state("networkidle")
-                await asyncio.sleep(4)
+                await asyncio.sleep(3)
                 
                 content = await page.content()
                 await browser.close()
 
-                # 判定キーワードの拡張（○、△に加え「残席」「わずか」「残り」「空席」を網羅）
                 seat_keywords = ["○", "△", "残席", "わずか", "残り", "空席"]
                 found_keyword = next((kw for kw in seat_keywords if kw in content), None)
 
@@ -252,7 +310,7 @@ def callback():
     events = body.get('events', [])
     
     for event in events:
-        if event.get('type') == 'message':
+        if event.get('type'] == 'message':
             reply_token = event.get('replyToken')
             user_id = event.get('source', {}).get('userId')
             user_text = event['message'].get('text', '')
