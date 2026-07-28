@@ -22,7 +22,7 @@ MAIL_PASSWORD = os.environ.get("MAIL_PASSWORD", "") # Render環境変数に設�
 
 # 空席検知時に通知を送るメールアドレスのリスト
 MAIL_RECIPIENTS_ALERT = ["ef65akatuki@gmail.com", "as1567@sel.co.jp"]
-# 定期生存確認を送るメールアドレス（ef65akatuki@gmail.com のみ）
+# 定期生存確認を送るメールアドレス
 MAIL_RECIPIENT_ALIVE = "ef65akatuki@gmail.com"
 
 SUNRISE_STATIONS = [
@@ -122,7 +122,7 @@ def send_alert_email(subject, body):
     except Exception as e:
         print(f"Failed to send alert email: {e}")
 
-# ─── Playwright による e5489 自動照会 ───
+# ─── Playwright による e5489 自動照会（判定・待機強化版） ───
 async def check_e5489_seats(parsed):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -136,13 +136,20 @@ async def check_e5489_seats(parsed):
             await page.fill('input[name="depStnName"]', parsed["dep"])
             await page.fill('input[name="arrStnName"]', parsed["arr"])
             await page.click('input[type="submit"]')
+            
+            # ネットワークが落ち着くまで待機したあと、念のためさらに数秒追加で待機して描画を確実に待つ
             await page.wait_for_load_state("networkidle")
+            await asyncio.sleep(3)
             
             content = await page.content()
             await browser.close()
 
-            if "○" in content or "△" in content:
-                return True, "空席あり（〇または△）"
+            # 判定キーワードを拡張（〇、△に加え、残席やわずかなどのテキストも検知）
+            seat_keywords = ["○", "△", "残席", "わずか", "残り", "空席"]
+            found_keyword = next((kw for kw in seat_keywords if kw in content), None)
+
+            if found_keyword:
+                return True, f"空席あり（検出キーワード: {found_keyword}）"
             else:
                 return False, "満席"
 
@@ -212,7 +219,7 @@ def monitor_loop():
                     send_alert_email(f"【空席検知】{parsed['train_name']} {date_str}", alert_msg)
                     monitoring_jobs.remove(job)
 
-            # 監視タスクが登録されている場合、ef65akatuki@gmail.com にのみ5分ごとの生存確認を送信
+            # 監視タスクが登録されている場合、生存確認を送信
             if monitoring_jobs:
                 jobs_text = "\n".join(job_summaries)
                 send_single_email(
